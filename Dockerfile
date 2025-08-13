@@ -1,49 +1,35 @@
-# ---- Base ----
-FROM node:22-bookworm-slim AS base
-ENV NODE_ENV=production \
-    NEXT_TELEMETRY_DISABLED=1
+# Stage 1: Build the application
+FROM node:20 AS builder
+
+# Set working directory
 WORKDIR /app
 
-# ---- Install deps (cached) ----
-FROM base AS deps
-# Only copy manifests to maximize cache
-COPY package.json package-lock.json ./
-# Ensure we use npm's lockfile strictly
-RUN npm ci
+# Copy package.json and package-lock.json first (for better caching)
+COPY package*.json ./
 
-# ---- Build ----
-FROM deps AS build
-# Copy the rest of the source
+# Install dependencies with npm
+RUN npm install
+
+# Copy the rest of the application files
 COPY . .
-# If you need build-time envs, let Easypanel pass them as build args:
-# ARG NEXT_PUBLIC_API_BASE_URL
-# ARG API_BASE_URL
-# ENV NEXT_PUBLIC_API_BASE_URL=$NEXT_PUBLIC_API_BASE_URL
-# ENV API_BASE_URL=$API_BASE_URL
+
+# Build the Next.js app
 RUN npm run build
 
-# ---- Prune dev deps for runtime ----
-FROM build AS prune
-RUN npm prune --omit=dev
+# Stage 2: Run the application
+FROM node:20
 
-# ---- Runtime ----
-FROM node:22-bookworm-slim AS runner
-ENV NODE_ENV=production \
-    PORT=3000 \
-    NEXT_TELEMETRY_DISABLED=1
 WORKDIR /app
 
-# Security: non-root user
-RUN useradd --user-group --create-home --shell /bin/bash nextjs
-USER nextjs
+# Copy only the built output and needed files from builder stage
+COPY --from=builder /app/package*.json ./
+COPY --from=builder /app/node_modules ./node_modules
+COPY --from=builder /app/.next ./.next
+COPY --from=builder /app/public ./public
+COPY --from=builder /app/next.config.mjs ./next.config.mjs
 
-# Minimal runtime files
-COPY --chown=nextjs:nextjs package.json ./
-COPY --chown=nextjs:nextjs --from=prune /app/node_modules ./node_modules
-COPY --chown=nextjs:nextjs --from=build /app/.next ./.next
-COPY --chown=nextjs:nextjs --from=build /app/public ./public
-COPY --chown=nextjs:nextjs --from=build /app/next.config.mjs ./next.config.mjs
-
+# Expose the port
 EXPOSE 3000
-# Bind to 0.0.0.0 for PaaS (Easypanel) environments
-CMD ["node", "node_modules/next/dist/bin/next", "start", "-H", "0.0.0.0", "-p", "3000"]
+
+# Run the Next.js app
+CMD ["npm", "start"]
