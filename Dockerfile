@@ -1,79 +1,46 @@
-# Multi-stage build for Next.js (non-standalone) using `next start`
-# Uses detection for yarn / npm / pnpm and installs prod deps in the final image.
-
-FROM node:20-alpine AS base
-
-# Install dependencies only when needed
-FROM base AS deps
-# libc6-compat may be needed by some native deps on Alpine
-RUN apk add --no-cache libc6-compat
-WORKDIR /
-
-# Copy manifests
-COPY package.json yarn.lock* package-lock.json* pnpm-lock.yaml* ./
-
-# Install dependencies based on the preferred package manager
-RUN set -eux; \
-    if [ -f yarn.lock ]; then yarn --frozen-lockfile; \
-    elif [ -f package-lock.json ]; then npm ci; \
-    elif [ -f pnpm-lock.yaml ]; then yarn global add pnpm && pnpm i --frozen-lockfile; \
-    else echo "Lockfile not found." && exit 1; \
-    fi
-
-# Rebuild the source code only when needed
-FROM base AS builder
-WORKDIR /
-COPY --from=deps /node_modules ./node_modules
-COPY . .
-
-# Disable Next telemetry during build
-ENV NEXT_TELEMETRY_DISABLED=1
-
-# Build (auto-picks your package manager via lockfile present)
-# If using yarn:
-# RUN yarn build
-# If using pnpm:
-# RUN pnpm build
-# Default to npm if package-lock exists:
-RUN if [ -f yarn.lock ]; then yarn build; \
-    elif [ -f package-lock.json ]; then npm run build; \
-    elif [ -f pnpm-lock.yaml ]; then yarn global add pnpm && pnpm build; \
-    else echo "No lockfile found for build step" && exit 1; \
-    fi
-
-# Production image
-FROM base AS runner
-WORKDIR /
-
+# ---- Base image with corepack (pnpm) enabled ----
+FROM node:22-bookworm-slim AS base
 ENV NODE_ENV=production
-ENV NEXT_TELEMETRY_DISABLED=1
+# Ensure a consistent working directory
+WORKDIR /app
+
+# Enable corepack so we can use pnpm pinned from lockfile
+RUN corepack enable
+
+# ---- Install deps (cached layer) ----
+FROM base AS deps
+# Copy only manifest files to maximize Docker layer caching
+COPY package.json pnpm-lock.yaml ./
+# Pre-fetch and install deps exactly as locked
+RUN pnpm fetch
+RUN pnpm install --frozen-lockfile
+
+# ---- Build ----
+FROM deps AS build
+# Copy the rest of the source
+COPY . .
+# Build Next.js (outputs to .next)
+RUN pnpm build
+
+# ---- Runtime (smallest possible) ----
+FROM node:22-bookworm-slim AS runner
+ENV NODE_ENV=production
 ENV PORT=3000
-ENV HOSTNAME=0.0.0.0
+WORKDIR /app
 
-# Create non-root user
-RUN addgroup --system --gid 1001 nodejs && adduser --system --uid 1001 nextjs
-
-# Copy only what's needed at runtime
-COPY --from=builder /public ./public
-COPY --from=builder /.next ./.next
-
-# Copy package manifests so we can install prod-only deps
-COPY package.json yarn.lock* package-lock.json* pnpm-lock.yaml* ./
-
-# Install production dependencies only
-RUN set -eux; \
-    if [ -f yarn.lock ]; then yarn --frozen-lockfile --production; \
-    elif [ -f package-lock.json ]; then npm ci --omit=dev; \
-    elif [ -f pnpm-lock.yaml ]; then yarn global add pnpm && pnpm i --frozen-lockfile --prod; \
-    else echo "Lockfile not found." && exit 1; \
-    fi
-
+# Create a non-root user for security
+RUN useradd --user-group --create-home --shell /bin/bash nextjs
 USER nextjs
 
-EXPOSE 3000
+# Only copy what’s needed at runtime
+COPY --chown=nextjs:nextjs package.json pnpm-lock.yaml ./
+COPY --chown=nextjs:nextjs --from=deps /app/node_modules ./node_modules
+COPY --chown=nextjs:nextjs --from=build /app/.next ./.next
+COPY --chown=nextjs:nextjs --from=build /app/public ./public
+COPY --chown=nextjs:nextjs next.config.mjs ./next.config.mjs
+# If you have a .env.production file you want baked in (optional):
+# COPY --chown=nextjs:nextjs .env.production ./.env.production
 
-# Start Next.js in production mode
-CMD [ \
-  "sh", "-c", \
-  "if [ -f yarn.lock ]; then yarn start; elif [ -f package-lock.json ]; then npm run start; elif [ -f pnpm-lock.yaml ]; then yarn global add pnpm && pnpm start; else echo 'No lockfile found.' && exit 1; fi" \
-]
+EXPOSE 3000
+# Next respects the PORT env var; no need to pass -p
+CMD ["node", "node_modules/next/dist/bin/next", "start"]
