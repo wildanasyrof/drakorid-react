@@ -1,35 +1,31 @@
-# Stage 1: Build the application
+# ---- Build stage ----
 FROM node:20 AS builder
-
-# Set working directory
 WORKDIR /app
 
-# Copy package.json and package-lock.json first (for better caching)
+# Install only what's needed using lockfile if present
 COPY package*.json ./
+RUN npm ci || npm install
 
-# Install dependencies with npm
-RUN npm install
-
-# Copy the rest of the application files
+# Copy source and build
 COPY . .
-
-# Build the Next.js app
 RUN npm run build
 
-# Stage 2: Run the application
-FROM node:20
-
+# ---- Runtime stage ----
+FROM node:20-slim
 WORKDIR /app
 
-# Copy only the built output and needed files from builder stage
+# Copy only what's needed at runtime
 COPY --from=builder /app/package*.json ./
-COPY --from=builder /app/node_modules ./node_modules
 COPY --from=builder /app/.next ./.next
 COPY --from=builder /app/public ./public
+# If you rely on next.config.mjs at runtime:
 COPY --from=builder /app/next.config.mjs ./next.config.mjs
 
-# Expose the port
+# Install production deps (Next needs some runtime deps)
+RUN npm ci --omit=dev || npm install --omit=dev
+
+ENV NODE_ENV=production
 EXPOSE 3000
 
-# Run the Next.js app
-CMD ["npm", "start"]
+# Make sure Next binds to the correct host/port
+CMD sh -c "npm start -- -p ${PORT:-3000} -H 0.0.0.0"
